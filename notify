@@ -1,0 +1,503 @@
+#!/usr/bin/env python
+# $Id: notify 1025 2007-05-20 21:02:39Z mattias $
+#
+# Configurable inotify based file system monitor
+#
+# mattias.wadman@galaxen.se
+
+
+import sys
+import os
+import errno
+import subprocess
+import optparse
+import time
+import string
+from signal import signal, SIGTERM
+from threading import *
+from Queue import Queue, deque, Empty
+from time import time, strftime
+
+from pyinotify import Notifier, WatchManager, EventsCodes, ProcessEvent
+
+from notifyconfig import *
+
+debug_level = 0
+
+def output(*texts):
+    for text in (strftime("%y%m%d %H:%M"),) + texts:
+        print text,
+    print
+    sys.stdout.flush()
+
+def message(*text):
+    output(*text)
+
+def error(text):
+    output("ERROR", text)
+
+def debug(text, level=1):
+    if level > debug_level:
+	return
+    output("DEBUG", text)
+
+
+class EventThread(Thread):
+    def __init__(self, *args, **kw):
+        Thread.__init__(self, *args, **kw)
+
+        debug("Starting %s" % self.getName())
+	
+        self.event_queue = Queue()
+
+    def post_event(self, event, *args, **kw):
+        self.event_queue.put(("event", (event, args, kw)))
+   
+    def post_quit(self):
+        self.event_queue.put(("quit", None))
+ 
+    def __try_call(self, name, args=(), kw={}):
+        try:
+            method = getattr(self, name)
+        except AttributeError, e:
+            debug("%s: %s not found" % (self.getName(), name), 3)
+            return None
+
+        debug("%s: %s(%s, %s)" % (self.getName(), name, args, kw), 3)
+        return method(*args, **kw)
+
+    def run(self):
+        while True:
+            timeout = self.__try_call("handle_before")
+            
+            try:
+                internal_event, data = \
+                        self.event_queue.get(timeout=timeout)
+            except Empty:
+                timeouted = True
+            else:
+                timeouted = False
+                if internal_event == "event":
+                    event, args, kw = data
+                    self.__try_call("handle_event_%s" % event, args, kw)
+                elif internal_event == "quit":
+                    self.__try_call("handle_quit")
+                    break
+                else:
+                    error("Unknown event %s %s" % (internal_event, data))
+                    break
+
+            self.__try_call("handle_after", (timeouted,))
+
+
+def fancy_command(command):
+    return command[0] + " " + " ".join(["'%s'" % c for c in command[1:]])
+
+def fancy_env(env):
+    return " ".join(["%s=%s" % (k, v) for k, v in env.items()])
+
+# Thread for executing subprocesses and poll them for termination
+class SubProcessThread(EventThread):
+    def __init__(self, config, *args, **kw):
+        EventThread.__init__(self, name="SubProcessThread" ,*args, **kw)
+        self.config = config
+	
+        self.processes_running = []
+        self.processes_queued = deque()
+
+
+    def run_queued(self):
+        while len(self.processes_queued) > 0 and \
+                len(self.processes_running) < \
+                self.config["config"]["subprocess_limit"].value:
+            try:
+                try:
+                    command, env = self.processes_queued.popleft()
+                except Empty:
+                    break
+                debug("Execute: %s" % fancy_command(command), 1)
+                debug("With env: %s" % fancy_env(env), 2)
+                p = subprocess.Popen(command,
+                        env=env, stdin=None,
+			# note, .file not .value of attribute
+                        stdout=self.config["config"]["subprocess_stdout"].file,
+                        stderr=self.config["config"]["subprocess_stderr"].file)
+            except OSError, e:
+                message("Execute failed: %s: %s" % (fancy_command(command), e))
+            else:
+                self.processes_running.append(p)
+
+    def poll_running(self):
+        l = filter(lambda p: p.poll() == None, self.processes_running)
+        debug("%d processes terminated, %d running" % \
+                (len(self.processes_running) - len(l), len(l)))
+        self.processes_running = l
+    
+    def handle_event_run(self, *data):
+        # data is (command, env)
+        self.processes_queued.append(data)
+
+    def handle_event_config(self):
+        # nothing for now, could copy values from self.config
+        pass
+    
+    def handle_before(self):
+        if len(self.processes_running) > 0:
+            return self.config["config"]["subprocess_poll_interval"].value
+        else:
+            return None
+
+    def handle_after(self, timeouted):
+        self.poll_running()
+        self.run_queued()
+
+
+class DelayedEvent:
+    def __init__(self, timestamp, event):
+        self.timestamp = timestamp
+        self.event = event
+
+# Thread for handling events from inotify, is a thread mostly
+# because of move event pair matching
+class NotifyEventThread(EventThread):
+    event_map = {
+            "IN_CREATE": "add",
+            "IN_MOVED_TO": "add",
+            "IN_DELETE": "delete",
+            "IN_MOVED_FROM": "delete",
+            "IN_CLOSE_NOWRITE": "close_nowrite",
+            "IN_CLOSE_WRITE": "close_write",
+            "IN_IGNORED": None, # skip
+            "IN_MOVE_SELF": None # skip
+            }
+
+    def __init__(self, config, subprocess_thread, *args, **kw):
+        EventThread.__init__(self, name="NotifyEventThread", *args, **kw)
+        self.config = config
+        self.subprocess_thread = subprocess_thread
+        
+        self.delayed_events = []
+    
+    def match(self, notify_event, notify_path, is_dir):
+        matches = []
+
+        # iterate over all sections in parsed order
+        for s in self.config:
+	    for event in ("stop", "event", notify_event):
+		if not s.attributes.has_key(event):
+		    continue
+		
+                # skip default section, etc
+		if s.re == None:
+		    continue
+		
+		# nothing to run and event is not stop
+                if s.attributes[event].value == [] and event != "stop":
+		    continue
+
+                # path type match
+                if (is_dir and s.is_file) or (not is_dir and s.is_dir):
+                    continue
+                
+		m = s.re.match(notify_path)
+		if not m:
+		    continue
+
+                # stop found, dont match any more sections 
+                if event == "stop":
+                    return matches
+
+		matches.append((s.attributes[event].value, m.groups()))
+
+        return matches
+    
+    def handle_event_notify(self, event, ignore_cookie=False):
+        notify_event = None
+        notify_env = {}
+        
+        path = event.path + os.path.sep + event.name
+
+        # new event with cookie
+        if not ignore_cookie and hasattr(event, "cookie"):
+            for delayed in self.delayed_events:
+                if delayed.event.cookie == event.cookie:
+                    debug("Cookie event with friend: %s" % delayed.event, 3)
+                    self.delayed_events.remove(delayed)
+                    notify_event = "move"
+                    if event.event_name == "IN_MOVED_TO":
+                        move_from = delayed.event
+                    else:
+                        # is it garanteed that IN_MOVED_FROM comes before
+                        # IN_MOVED_TO? to be sure, swap if not
+                        move_from, event = event, delayed.event
+                    path_old = move_from.path + os.path.sep + move_from.name
+                    notify_env["NOTIFY_PATH_OLD"] = path_old
+                
+                    debug("%s: %s -> %s" % (notify_event, path_old, path))
+                    break
+            else:
+                debug("Cookie event without a friend, delaying: %s" % event, 3)
+                # append and wait for friend or timeout
+                self.delayed_events.append(DelayedEvent(time(), event))
+                return
+        
+        if notify_event != None:
+            # event type already decided
+            pass
+        else:
+            if self.event_map.has_key(event.event_name):
+                notify_event = self.event_map[event.event_name]
+            else:
+                error("Unknown event %s" % event)
+                return
+
+	    # IN_IGNORED, skip, some watched path was removed, ignore
+            # IN_MOVE_SELF, skip, pyinotify needs it to handle directory moves
+            if notify_event == None:
+                return
+        
+            debug("%s: %s" % (notify_event, path))
+
+        notify_env["NOTIFY_PATH"] = path
+        notify_env["NOTIFY_EVENT"] = notify_event
+        notify_env["NOTIFY_DEBUG"] = str(debug_level)
+
+        for args, groups in self.match(notify_event, path, event.is_dir):
+            runenv = dict(os.environ)
+            for key, attr in self.config["env"].items():
+                runenv[key] = attr.value
+            i = 1
+            for g in groups:
+                runenv["NOTIFY_MATCH_%d" % i] = g
+                i += 1
+            runenv.update(notify_env)
+
+            expanded = []
+            try:
+                for arg in args:
+                    expanded.append(string.Template(arg).substitute(runenv))
+            except KeyError, e:
+                message("Failed to expand %s for %s" % (e, args))
+            except ValueError:
+                message("Failed to expand %s: %s" % (args, e))
+            else:
+                self.subprocess_thread.post_event("run", expanded, runenv)
+
+    def handle_event_config(self):
+        # nothing for now, could copy values from self.config
+        pass
+    
+    def handle_before(self):
+        if len(self.delayed_events) > 0:
+            return self.config["config"]["move_event_timeout"].value
+        else:
+            return None
+
+    def handle_after(self, timeouted):
+        now = time()
+        for delayed in self.delayed_events:
+            if now - delayed.timestamp > \
+                    self.config["config"]["move_event_timeout"].value:
+                debug("Delayed event timed out, process it: %s" % \
+			delayed.event, 3)
+                self.delayed_events.remove(delayed)
+                # add event to self, this time ignore cookie value
+                self.post_event("notify", delayed.event, True)
+            else:
+                # no need to look further, list is sorted
+                break
+
+
+class ConfigProcess(ProcessEvent):
+    def __init__(self, config, wm, threads):
+        ProcessEvent()
+	self.wm = wm
+	self.config = config
+        self.threads = threads
+
+        self.add_watch()
+  
+    # lazy, use ConfigProcess as config reload callback class
+    def reload(self, old_config, new_config):
+        global debug_level, sys
+        
+        if old_config != None:
+            debug("Config reload callback, last in old", 3)
+       
+        if not new_config["config"]["foreground"].value:
+            for attr in ("stdout", "stderr"):
+                setattr(sys, attr, new_config["config"][attr].file)
+        
+        if old_config == None:
+            message("Starting (pid %d)" % os.getpid())
+        debug("Config reload callback, first in new", 3)
+        
+        debug_level = new_config["config"]["debug"].value
+       
+        # first time, diff to empty set
+        if old_config == None:
+            old_watches = set()
+        else:
+            old_watches = set(old_config["watch"].keys())
+        new_watches = set(new_config["watch"].keys())
+        self.wm.diff(old_watches, new_watches)
+        
+        for thread in self.threads:
+            thread.post_event("config")
+
+
+    def add_watch(self):
+        self.wm.add_watch(self.config.config_path, EventsCodes.IN_CLOSE_WRITE,
+                proc_fun=self)
+
+    def process_default(self, event):
+        debug("ConfigProcess %s" % event, 2)
+        try:
+            self.config.read(callback=self)
+        except NotifyConfigError, e:
+            message(e)
+   
+	# re-add if config file inode was removed
+	if event.event_name == "IN_IGNORED":
+            self.add_watch()
+
+
+class WatchProcess(ProcessEvent):
+    def __init__(self, notifyevent_thread):
+        ProcessEvent()
+        self.notifyevent_thread = notifyevent_thread
+
+    def process_default(self, event):
+        debug("WatchProcess %s" % event, 2)
+        self.notifyevent_thread.post_event("notify", event)
+
+
+class NotifyWatchManager(WatchManager):
+    mask = \
+        EventsCodes.IN_CREATE | \
+        EventsCodes.IN_DELETE | \
+        EventsCodes.IN_MOVED_FROM | \
+        EventsCodes.IN_MOVED_TO | \
+        EventsCodes.IN_CLOSE_NOWRITE | \
+        EventsCodes.IN_CLOSE_WRITE
+
+    # must be added to make pyinotify able to handle directory moves
+    mask = mask | EventsCodes.IN_MOVE_SELF
+
+    def diff(self, old, new):
+        # added paths
+        for path in new.difference(old):
+            debug("Adding watch for %s" % path)
+            try:
+                r = self.add_watch(path, self.mask, rec=True, auto_add=True, \
+                        do_glob=False)
+            except OSError, e:
+                # TODO: rewrite, ENOSPC.. or use improved message from pyinotify
+                if e.errno != errno.ENOENT:
+                    raise
+                message("Failed to add watch for %s" % path)
+        
+        debug("Done adding")
+        
+        # removed paths
+        for path in old.difference(new):
+            debug("Removing watch for %s" % path)
+            # TOOD: pyinotify prints stuff to stderr on error, hmm
+            if self.get_wd(path) != None:
+                self.rm_watch(self.get_wd(path), rec=True)
+
+
+class SigtermException(Exception): pass
+
+def sigterm(signum, stack):
+    message("Got signal SIGTERM")
+    raise SigtermException()
+
+
+def loop(config):
+    try:
+        signal(SIGTERM, sigterm)
+        
+        subprocess_thread = SubProcessThread(config)
+        subprocess_thread.start()
+        
+        notifyevent_thread = NotifyEventThread(config, subprocess_thread)
+        notifyevent_thread.start()
+
+        threads = [subprocess_thread, notifyevent_thread]
+        
+        wm = NotifyWatchManager()
+        no = Notifier(wm, WatchProcess(notifyevent_thread))
+        c = ConfigProcess(config, wm, threads)
+
+        # initial config reload, will also print out "Starting.. " message
+        c.reload(None, config)
+
+        while True:
+            no.process_events()
+            if no.check_events():
+                no.read_events()
+    
+    except KeyboardInterrupt:
+        pass
+    except SigtermException:
+	pass
+    
+    message("Stopping")
+
+    no.stop()
+
+    for thread in threads:
+        thread.post_quit()
+
+
+def main():
+    optparser = optparse.OptionParser()
+    optparser.usage = "Usage: %prog [options] config"
+    optparser.set_defaults(debug=0, foreground=None)
+    optparser.add_option("-d", "--debug", dest="debug",
+	    type="int", help="Debug level")
+    optparser.add_option("-f", "--foreground", dest="foreground",
+	    action="store_true", help="Run in foreground")
+    
+    (options, args) = optparser.parse_args()
+
+    if len(args) != 1:
+        print "You need to specify a config file"
+        sys.exit(1)
+
+    override = {}
+    # a bit ugly, override values should be in same type as before
+    # config eval (str)
+    if optparser.values.foreground != None:
+	override["foreground"] = str(optparser.values.foreground)
+    if optparser.values.debug != None:
+	override["debug"] = str(optparser.values.debug)
+    if optparser.values.foreground:
+	override["stdout"] = "/dev/stdout"
+	override["stderr"] = "/dev/stderr"
+    
+    try:
+        config = NotifyConfig(os.path.abspath(args[0]), os.getcwd())
+        config.read(override)
+    except NotifyConfigError, e:
+        print e
+        sys.exit(1)
+
+    if not config["config"]["foreground"].value:
+        try:
+            if os.fork() > 0:
+                sys.exit(0)
+        except OSError, e:
+            print "Failed to fork: %s" % e
+            sys.exit(1)
+        
+        os.chdir("/")
+        os.setsid()
+        os.umask(0)
+    
+    loop(config)
+
+if __name__ == '__main__':
+    main()
+

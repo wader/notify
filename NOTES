@@ -1,0 +1,88 @@
+-d and reload config, will reset debug level
+-f and reload config, will not change stdout, stdin redirect
+
+Failed to add watch for /path?
+You have probably hit a inotify limit, increse it 
+
+python regexp, /bla$/ -> /.*bla$/
+
+sighup, config reload... config on non inotify fs
+
+find /path -type d | wc -l
+
+echo NUMBER > /proc/sys/fs/inotify/max_user_watches
+
+set NOTIFY_DEBUG when -d? -dd sets to 2?
+
+action to run python code insted of forking process?
+
+debug from notifyconfig, look at python logging modules
+
+env -i PATH=$PATH USER=$USER ./notify ...
+
+
+# TODO: more events, dynamically subscribe for different event depending
+# on matching rules
+# TODO: multiple actions with same name
+
+escape lines in config?
+add sh -c "\
+    tjo ; \
+    bla \
+    "
+-> add sh -c "tjo; bla "
+
+why not shell=true? for subprocess
+
+batch... fake events? more abstract event handling
+
+default and multiple commands... merge? how to exclude?
+remove default:
+add some kind of command groups?
+
+@add_tag:
+    add tag_add
+
+@del_tag
+    delete tag_delete
+
+@tag:
+    group add_tag
+    group del_tag
+    group tag
+
+@add_tag:
+    add tag_add $NOTIFY_PATH
+    delete tag_remove $NOTIFY_PATH
+
+/film/.*/i:
+    group add_tag
+
+
+pyinotify issues:
+
+prints stuff to stderr on error, hmm
+
+add/rm_watch error return, not possiuble to diff between pathd oes not exist and out of resources
+
+suspend/resume:
+Traceback (most recent call last):
+  File "./notify", line 494, in ?
+    main()
+  File "./notify", line 491, in main
+    loop(config)
+  File "./notify", line 430, in loop
+    if no.check_events():
+  File "/usr/lib/python2.4/site-packages/pyinotify/pyinotify.py", line 554, in check_events
+    ret = self._pollobj.poll(timeout)
+select.error: (4, 'Interrupted system call')
+
+        while 1:
+            try: r,w,e = select.select (r,w,e, timeout)
+            except select.error, v:
+                if v[0] != EINTR: raise
+            else: break
+
+add_watch globbing optional...
+
+

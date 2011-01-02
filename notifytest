@@ -1,0 +1,42 @@
+#!/usr/bin/env python
+
+import sys
+import os
+
+from notifyconfig import *
+
+if len(sys.argv) < 2:
+    print "Usage: %s config [file]..." % sys.argv[0]
+    sys.exit(1)
+
+def test():
+    try:
+	c = NotifyConfig(sys.argv[1], os.getcwd())
+        c.read()
+    except NotifyConfigError, e:
+	print e
+	sys.exit(1)
+
+    if len(sys.argv) > 2:
+	for file in sys.argv[2:]:
+	    print "%s:" % file
+	    for e in ("add", "delete", "move", "modify"):
+		print "  %s" % e
+                d = {}
+                if e == "move":
+                    d["NOTIFY_PATH_OLD"] = file + "_old"
+                d["NOTIFY_PATH"] = file
+                d["NOTIFY_EVENT"] = file
+		for command, groups in c.match(e, file, False):
+		    print "    %s" % " ".join(command)
+                    i = 1
+                    for g in groups:
+                        d["NOTIFY_MATCH_%d" % i] = g
+		    for k, v in d.items():
+			print "    $%s=%s" % (k, v)
+                    print
+    else:
+        print c.dump()
+
+test()
+
